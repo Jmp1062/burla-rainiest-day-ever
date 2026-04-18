@@ -24,12 +24,16 @@ Env vars:
 
 from __future__ import annotations
 
+import os
+
+# Disable Burla's telemetry for dev/test runs (must be set before importing burla).
+os.environ.setdefault("DISABLE_BURLA_TELEMETRY", "True")
+
 import csv
 import gzip
 import heapq
 import io
 import json
-import os
 import sys
 import time
 from datetime import datetime, timezone
