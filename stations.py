@@ -11,6 +11,7 @@ https://www.ncei.noaa.gov/pub/data/ghcn/daily/readme.txt (section IV)
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -19,6 +20,10 @@ import requests
 STATIONS_URL = "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt"
 COUNTRIES_URL = "https://www.ncei.noaa.gov/pub/data/ghcn/daily/ghcnd-countries.txt"
 
+# Bundled snapshot shipped with the repo so the demo is reproducible even if
+# NOAA is down / rate-limiting. Refresh with: python refresh_station_snapshot.py
+_BUNDLED_DIR = Path(__file__).resolve().parent / "data"
+
 
 def _cache_dir() -> Path:
     d = Path(os.environ.get("GHCN_CACHE_DIR", "/tmp/ghcn-cache"))
@@ -26,9 +31,25 @@ def _cache_dir() -> Path:
     return d
 
 
-def _download(url: str, dest: Path) -> Path:
+def _materialize(url: str, dest: Path, force_refresh: bool = False) -> Path:
+    """Populate `dest` from bundled snapshot if present, else download from NOAA.
+
+    Priority order:
+      1. `force_refresh=True` -> redownload from NOAA, overwrite cache.
+      2. Already in cache -> reuse.
+      3. Bundled snapshot in `<repo>/data/<basename>` -> copy to cache.
+      4. Fall back to NOAA download.
+    """
+    if force_refresh and dest.exists():
+        dest.unlink()
     if dest.exists() and dest.stat().st_size > 0:
         return dest
+
+    bundled = _BUNDLED_DIR / dest.name
+    if bundled.exists() and bundled.stat().st_size > 0 and not force_refresh:
+        shutil.copyfile(bundled, dest)
+        return dest
+
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
         with dest.open("wb") as f:
@@ -41,9 +62,7 @@ def _download(url: str, dest: Path) -> Path:
 def load_countries(force_refresh: bool = False) -> Dict[str, str]:
     """Return mapping FIPS-2 country code -> country name."""
     path = _cache_dir() / "ghcnd-countries.txt"
-    if force_refresh and path.exists():
-        path.unlink()
-    _download(COUNTRIES_URL, path)
+    _materialize(COUNTRIES_URL, path, force_refresh=force_refresh)
     out: Dict[str, str] = {}
     with path.open("r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -60,9 +79,7 @@ def load_countries(force_refresh: bool = False) -> Dict[str, str]:
 def load_stations(force_refresh: bool = False) -> Dict[str, dict]:
     """Return mapping station_id -> metadata dict (name, lat, lon, elev, country, state)."""
     path = _cache_dir() / "ghcnd-stations.txt"
-    if force_refresh and path.exists():
-        path.unlink()
-    _download(STATIONS_URL, path)
+    _materialize(STATIONS_URL, path, force_refresh=force_refresh)
     countries = load_countries(force_refresh=False)
 
     out: Dict[str, dict] = {}

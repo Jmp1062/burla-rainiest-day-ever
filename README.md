@@ -72,6 +72,32 @@ of every major wet-weather regime on Earth.
   `ID, YYYYMMDD, ELEMENT, DATA VALUE, M-FLAG, Q-FLAG, S-FLAG, OBS-TIME`
 - **Units:** PRCP is stored in **tenths of mm**; we divide by 10.
 
+### Bundled station snapshot (`data/`)
+
+Station names, lat/lon, elevation, and country come from NOAA's
+`ghcnd-stations.txt` (129,657 rows, ~11 MB) and `ghcnd-countries.txt`
+(219 rows). Both are committed into `data/` as a **point-in-time snapshot**
+so the demo is reproducible even if NOAA is down or rate-limiting:
+
+```
+data/
+├── ghcnd-stations.txt    # 11 MB, 129,657 rows (id -> name, lat, lon, elev, state)
+└── ghcnd-countries.txt   # 4 KB, 219 rows     (country_code -> country name)
+```
+
+Both `stations.py` (local path) and `_load_stations_inline()` (Burla reduce
+worker) look up the bundle first and fall back to NOAA if it's missing.
+When `main()` runs on Burla it also stages the bundle once into
+`/workspace/shared/ghcn/meta/` so every subsequent reduce run hits GCS
+instead of NOAA.
+
+**Refreshing the snapshot** — whenever NOAA publishes a newer station file:
+
+```bash
+python refresh_station_snapshot.py
+git add data/ && git commit -m "refresh station snapshot"
+```
+
 ## Filters
 
 - `ELEMENT == "PRCP"` (single-day totals only; multi-day `MDPR` totals excluded).
@@ -174,19 +200,23 @@ before the call. The starter kit's `onboard.py` handles that via a UI
 
 ```
 agents/ghcn-rainiest-day/
-├── ghcn_pipeline.py      # process_year + reduce_years + main()
-├── stations.py           # local fixed-width ghcnd-stations.txt parser (for local_validate.py)
-├── local_validate.py     # two-year smoke test, no Burla
-├── fetch_artifacts.py    # helper to pull /workspace/shared/ghcn/results/* back locally
-├── render_map_local.py   # regenerate map.html from top_500.csv locally
-├── requirements.txt      # requests, folium, burla
-├── README.md             # (this file)
+├── ghcn_pipeline.py            # process_year + reduce_years + main()
+├── stations.py                 # fixed-width ghcnd-stations.txt parser (for local_validate.py)
+├── local_validate.py           # two-year smoke test, no Burla
+├── fetch_artifacts.py          # helper to pull /workspace/shared/ghcn/results/* back locally
+├── render_map_local.py         # regenerate map.html from top_500.csv locally
+├── refresh_station_snapshot.py # refresh data/*.txt from NOAA
+├── requirements.txt            # requests, folium, burla
+├── README.md                   # (this file)
 ├── .gitignore
-├── burla_results/        # artifacts from the latest Burla run
+├── data/                       # bundled NOAA station snapshot
+│   ├── ghcnd-stations.txt      # 11 MB, 129,657 rows
+│   └── ghcnd-countries.txt     # 4 KB, 219 rows
+├── burla_results/              # artifacts from the latest Burla run
 │   ├── top_result.json
 │   ├── top_500.csv
 │   ├── top_by_station.csv
 │   ├── map.html
 │   └── run_summary.json
-└── local_shared/         # sandbox for local_validate.py (gitignored)
+└── local_shared/               # sandbox for local_validate.py (gitignored)
 ```

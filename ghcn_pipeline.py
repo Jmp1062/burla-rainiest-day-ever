@@ -187,57 +187,119 @@ def _write_part(year: int, obj: dict) -> str:
     return str(path)
 
 
-def _load_stations_inline() -> dict:
-    """Download + parse ghcnd-stations.txt and ghcnd-countries.txt inline.
+def _find_local_meta(name: str) -> "Path | None":
+    """Return a path to a bundled/staged copy of `name`, or None.
 
-    Duplicated from stations.py so reduce_years is self-contained on remote
-    workers (Burla only ships the pickled function, not sidecar modules).
+    Lookup order:
+      1. <script_dir>/data/<name>   -- bundled snapshot checked into the repo
+      2. /workspace/shared/ghcn/meta/<name>   -- staged once on Burla shared FS
+    Both paths are cheap to check and gracefully return None on remote workers
+    that don't have the bundled source tree.
+    """
+    from pathlib import Path as _Path
+
+    candidates = []
+    try:
+        candidates.append(_Path(__file__).resolve().parent / "data" / name)
+    except NameError:
+        pass
+    candidates.append(_Path("/workspace/shared/ghcn/meta") / name)
+
+    for c in candidates:
+        try:
+            if c.exists() and c.stat().st_size > 0:
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def _stage_meta_to_shared(payload: dict) -> str:
+    """Write the bundled station snapshot into /workspace/shared/ghcn/meta/.
+
+    Runs once per Burla job on a single worker. Idempotent: a second call
+    simply overwrites. Input `payload` is a dict of {filename: bytes}.
+    """
+    from pathlib import Path as _Path
+
+    meta_dir = _Path("/workspace/shared/ghcn/meta")
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    written: list = []
+    for name, data in payload.items():
+        dst = meta_dir / name
+        dst.write_bytes(data)
+        written.append(f"{name} ({dst.stat().st_size} bytes)")
+    return "staged: " + ", ".join(written)
+
+
+def _load_stations_inline() -> dict:
+    """Parse ghcnd-stations.txt and ghcnd-countries.txt into an id -> metadata dict.
+
+    Prefers a bundled snapshot (`<repo>/data/` or `/workspace/shared/ghcn/meta/`)
+    and falls back to streaming from NOAA. Duplicated from stations.py so
+    reduce_years is self-contained on remote workers (Burla only ships the
+    pickled function, not sidecar modules or the source tree).
     """
     import requests
 
     headers = {"User-Agent": "ghcn-rainiest-day/1.0 (+burla demo)"}
 
     countries: dict = {}
-    with requests.get(COUNTRIES_URL, timeout=120, headers=headers) as r:
-        r.raise_for_status()
-        for line in r.text.splitlines():
-            if len(line) < 3:
-                continue
-            code = line[0:2]
-            name = line[3:].strip()
-            if code and name:
-                countries[code] = name
+    local_countries = _find_local_meta("ghcnd-countries.txt")
+    if local_countries is not None:
+        print(f"reduce: using bundled countries file {local_countries}")
+        countries_text = local_countries.read_text(encoding="utf-8", errors="replace")
+    else:
+        print(f"reduce: downloading {COUNTRIES_URL}")
+        with requests.get(COUNTRIES_URL, timeout=120, headers=headers) as r:
+            r.raise_for_status()
+            countries_text = r.text
+    for line in countries_text.splitlines():
+        if len(line) < 3:
+            continue
+        code = line[0:2]
+        name = line[3:].strip()
+        if code and name:
+            countries[code] = name
 
     stations: dict = {}
-    with requests.get(STATIONS_URL, stream=True, timeout=300, headers=headers) as r:
-        r.raise_for_status()
-        for raw in r.iter_lines(decode_unicode=True):
-            if not raw or len(raw) < 72:
-                continue
-            sid = raw[0:11].strip()
-            if len(sid) != 11:
-                continue
-            try:
-                lat = float(raw[12:20].strip())
-                lon = float(raw[21:30].strip())
-            except ValueError:
-                continue
-            try:
-                elev = float(raw[31:37].strip())
-            except ValueError:
-                elev = None
-            state = raw[38:40].strip()
-            name = raw[41:71].strip()
-            stations[sid] = {
-                "station_id": sid,
-                "name": name,
-                "lat": lat,
-                "lon": lon,
-                "elev_m": elev,
-                "state": state or None,
-                "country_code": sid[:2],
-                "country": countries.get(sid[:2], sid[:2]),
-            }
+    local_stations = _find_local_meta("ghcnd-stations.txt")
+    if local_stations is not None:
+        print(f"reduce: using bundled stations file {local_stations}")
+        src_iter = local_stations.read_text(encoding="utf-8", errors="replace").splitlines()
+    else:
+        print(f"reduce: downloading {STATIONS_URL}")
+        resp = requests.get(STATIONS_URL, stream=True, timeout=300, headers=headers)
+        resp.raise_for_status()
+        src_iter = resp.iter_lines(decode_unicode=True)
+
+    for raw in src_iter:
+        if not raw or len(raw) < 72:
+            continue
+        sid = raw[0:11].strip()
+        if len(sid) != 11:
+            continue
+        try:
+            lat = float(raw[12:20].strip())
+            lon = float(raw[21:30].strip())
+        except ValueError:
+            continue
+        try:
+            elev = float(raw[31:37].strip())
+        except ValueError:
+            elev = None
+        state = raw[38:40].strip()
+        name = raw[41:71].strip()
+        stations[sid] = {
+            "station_id": sid,
+            "name": name,
+            "lat": lat,
+            "lon": lon,
+            "elev_m": elev,
+            "state": state or None,
+            "country_code": sid[:2],
+            "country": countries.get(sid[:2], sid[:2]),
+        }
     return stations
 
 
@@ -481,6 +543,35 @@ def main() -> int:
     from burla import remote_parallel_map  # type: ignore
 
     reduce_only = os.environ.get("REDUCE_ONLY", "").strip() not in ("", "0", "false", "False")
+
+    bundled_dir = Path(__file__).resolve().parent / "data"
+    stations_bundle = bundled_dir / "ghcnd-stations.txt"
+    countries_bundle = bundled_dir / "ghcnd-countries.txt"
+    if stations_bundle.exists() and countries_bundle.exists():
+        try:
+            print(
+                f"staging bundled station metadata ({stations_bundle.stat().st_size:,} + "
+                f"{countries_bundle.stat().st_size:,} bytes) to /workspace/shared/ghcn/meta/ ..."
+            )
+            payload = {
+                stations_bundle.name: stations_bundle.read_bytes(),
+                countries_bundle.name: countries_bundle.read_bytes(),
+            }
+            stage_result = list(
+                remote_parallel_map(
+                    _stage_meta_to_shared,
+                    [payload],
+                    func_cpu=1,
+                    func_ram=4,
+                )
+            )
+            print(f"stage ok: {stage_result}")
+        except Exception as exc:
+            print(f"stage skipped ({exc}); reduce will fall back to NOAA download")
+    else:
+        print(
+            f"no bundled snapshot found at {bundled_dir}; reduce will download from NOAA"
+        )
 
     if reduce_only:
         print("REDUCE_ONLY=1: skipping map phase; reduce worker will glob /workspace/shared/ghcn/parts/")
